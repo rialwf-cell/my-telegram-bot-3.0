@@ -1,268 +1,398 @@
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup, KeyboardButton
-from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters, ConversationHandler
-from telegram.ext.filters import Chat
-import asyncio
-from datetime import datetime, timedelta
-import json
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+"""
+Бот‑сервис «Канал + Предложки + Лабиринт»
+(Python‑telegram‑bot v20.7+, Python 3.10+)
+
+*   полностью удалена статистика побед/поражений в сообщениях игрока
+*   плейсхолдер «NICKNAMES» теперь подменяется случайным образом.
+"""
+
+# --------------------------------------------------
+# 1. Подключаем библиотеки
+# --------------------------------------------------
 import os
+import json
+import re
+import asyncio
 import random
 import logging
 
-# Настройка логирования
-logging.basicConfig(
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-    level=logging.INFO
+from datetime import datetime, timedelta
+from collections import defaultdict
+
+from telegram import (
+    Update,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    ReplyKeyboardMarkup,
 )
-logger = logging.getLogger(__name__)
+from telegram.ext import (
+    Application,
+    CommandHandler,
+    ContextTypes,
+    MessageHandler,
+    ConversationHandler,
+    filters,
+)
 
-# Состояния
-GET_TEXT, GET_BUTTONS, LABYRINTH_GAME = range(3)
+# --------------------------------------------------
+# 2. Настройки
+# --------------------------------------------------
+BOT_TOKEN = "***************"   # ← замените на токен своего бота
 
-# 🆕👇👇👇 ЗДЕСЬ ТЕБЕ НУЖНО ВПИСАТЬ СВОИ ДАННЫЕ 👇👇👇
-BOT_TOKEN = "**********************"  # ← Твой токен бота
-ADMIN_IDS = [*************]  # ← Твой ID (и других админов, если нужно, через запятую)
-CHANNEL_USERNAME = "*****************"  # ← Username твоего канала (без @)
-CHANNEL_CHAT_ID = -100***********  # ← ID твоего канала
-GROUP_CHAT_ID = -1002**************    # ← ID твоей группы (куда пересылаем предложки)
-# 🎯 СЮДА ВПИШИ ID ТЕМЫ (ТОПИКА) В ГРУППЕ:
-SUGGESTION_TOPIC_ID = *****  # ← 🔁 ЗАМЕНИ ЭТО ЧИСЛО НА РЕАЛЬНЫЙ ID ТЕМЫ
-# ✅ Исправлено: ADMIN_CHAT_ID объявлен ПОСЛЕ GROUP_CHAT_ID
-ADMIN_CHAT_ID = GROUP_CHAT_ID  # 🆕 Предложки пересылаются в группу
-# 🆕🔥🔥🔥 ОЧЕНЬ ВАЖНО: УКАЗАН ID ЧАТА КОММЕНТАРИЕВ — НЕ НУЖНО МЕНЯТЬ!
-COMMENTS_CHAT_ID = -***************  # ID чата канала
-# 🆕👆👆👆 ВСЁ, ЧТО НУЖНО НАСТРОИТЬ — ВЫШЕ ЭТОЙ СТРОКИ 👆👆👆
+ADMIN_IDS = [**********]              # ← ID(ы) админов
+CHANNEL_USERNAME = "**********"  # ← username канала без @
+CHANNEL_CHAT_ID = -100************     # ← ID канала
+GROUP_CHAT_ID = -100***********       # ← ID группы для предложек
+SUGGESTION_TOPIC_ID = ****           # ← ID темы в группе
+ADMIN_CHAT_ID = GROUP_CHAT_ID
+COMMENTS_CHAT_ID = -100***********    # ← чат с комментариями
 
-# Файлы для хранения данных
+# Файлы
 STATS_FILE = "bot_stats.json"
 USERS_FILE = "bot_users.json"
 POSTS_FILE = "bot_posts.json"
-MIRROR_MAP_FILE = "mirror_map.json"  # Файл для хранения связки ID
+MIRROR_MAP_FILE = "mirror_map.json"
 PROMOS_FILE = "promos.txt"
+PROMO_STATS_FILE = "promo_stats.json"
 
-# Тестовый флаг: лимит одной игры в сутки
-# False — лимит отключен (для тестов), True — лимит включен
-LABYRINTH_DAILY_LIMIT_ENABLED = False
+# Лабиринт
+LABYRINTH_MAX_STEPS = 10
+LABYRINTH_START_HP = 10
+LABYRINTH_DAILY_LIMIT_ENABLED = False  # временно отключено ограничение 1‑раз‑в‑сутки
+LABYRINTH_PROMO_LIMIT_PER_DAY = 5
 
-# Клавиатуры (БЕЗ ЭМОДЗИ на кнопках)
-ADMIN_KEYBOARD = ReplyKeyboardMarkup([
-    ["Создать пост", "Статистика"],
-    ["Пользователи", "Настройки"],
-    ["Обычный режим"]
-], resize_keyboard=True)
+# Клавиатуры
+ADMIN_KEYBOARD = ReplyKeyboardMarkup(
+    [
+        ["Создать пост", "Статистика"],
+        ["Пользователи", "Настройки"],
+        ["Обычный режим"],
+    ],
+    resize_keyboard=True,
+)
 
-# ✅ ИЗМЕНЕНО: Кнопка "🔐 Я администратор" теперь ВСЕГДА видна всем пользователям
-USER_KEYBOARD = ReplyKeyboardMarkup([
-    ["Предложить новость", "Играть в Лабиринт"],
-    ["Помощь", "🔐 Я администратор"]
-], resize_keyboard=True)
+USER_KEYBOARD = ReplyKeyboardMarkup(
+    [
+        ["Предложить новость", "Играть в Лабиринт"],
+        ["Помощь", "🔐 Я администатор"],
+    ],
+    resize_keyboard=True,
+)
 
-# ===== СИСТЕМА СВЯЗКИ ID ПОСТОВ =====
-def load_mirror_map():
-    if os.path.exists(MIRROR_MAP_FILE):
+# Состояния ConversationHandler
+GET_TEXT, GET_BUTTONS, LABYRINTH_GAME = range(3)
+
+# ────────────────────────────────────────────────────────────────────────
+# 2.ЛОГИРОВАНИЕ
+# ────────────────────────────────────────────────────────────────────────
+logging.basicConfig(
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    level=logging.INFO,
+)
+logger = logging.getLogger(__name__)
+
+# --------------------------------------------------
+# 4. Подключение файлов
+# --------------------------------------------------
+def load_json(path: str, default):
+    if os.path.exists(path):
         try:
-            with open(MIRROR_MAP_FILE, 'r', encoding='utf-8') as f:
+            with open(path, "r", encoding="utf-8") as f:
                 return json.load(f)
-        except:
-            pass
-    return {}
-
-def save_mirror_map(mirror_map):
-    with open(MIRROR_MAP_FILE, 'w', encoding='utf-8') as f:
-        json.dump(mirror_map, f, ensure_ascii=False, indent=2)
-
-# 🛠️ ВСПОМОГАТЕЛЬНАЯ ФУНКЦИЯ: преобразует set → list рекурсивно
-def convert_sets_to_lists(obj):
-    if isinstance(obj, set):
-        return list(obj)
-    elif isinstance(obj, dict):
-        return {k: convert_sets_to_lists(v) for k, v in obj.items()}
-    elif isinstance(obj, list):
-        return [convert_sets_to_lists(i) for i in obj]
-    else:
-        return obj
-
-# ===== СИСТЕМА СТАТИСТИКИ И ПОСТОВ =====
-def load_stats():
-    """Загружает статистику из файла"""
-    if os.path.exists(STATS_FILE):
-        try:
-            with open(STATS_FILE, 'r', encoding='utf-8') as f:
-                data = json.load(f)
-                if 'active_users' in data and isinstance(data['active_users'], list):
-                    data['active_users'] = set(data['active_users'])
-                return data
         except Exception as e:
-            print(f"Ошибка при загрузке статистики: {e}")
-    return {
-        "total_suggestions": 0,
-        "published": 0,
-        "rejected": 0,
-        "today_suggestions": 0,
-        "today_date": datetime.now().strftime("%Y-%m-%d"),
-        "users_count": 0,
-        "active_users": set()
-    }
+            logger.warning(f"Error reading {path}: {e}")
+    return default
+
+
+def save_json(path: str, data):
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+
+
+def load_stats():
+    data = load_json(
+        STATS_FILE,
+        {
+            "total_suggestions": 0,
+            "published": 0,
+            "rejected": 0,
+            "today_suggestions": 0,
+            "today_date": datetime.now().strftime("%Y-%m-%d"),
+            "users_count": 0,
+            "active_users": set(),
+        },
+    )
+    if isinstance(data.get("active_users", []), list):
+        data["active_users"] = set(data["active_users"])
+    return data
+
 
 def save_stats(stats):
-    """Сохраняет статистику в файл"""
-    stats_copy = stats.copy()
-    if 'active_users' in stats_copy and isinstance(stats_copy['active_users'], set):
-        stats_copy['active_users'] = list(stats_copy['active_users'])
-    with open(STATS_FILE, 'w', encoding='utf-8') as f:
-        json.dump(stats_copy, f, ensure_ascii=False, indent=2)
+    s = stats.copy()
+    s["active_users"] = list(s["active_users"])
+    save_json(STATS_FILE, s)
+
 
 def load_users():
-    """Загружает список пользователей"""
-    if os.path.exists(USERS_FILE):
-        try:
-            with open(USERS_FILE, 'r', encoding='utf-8') as f:
-                return json.load(f)
-        except:
-            pass
-    return {}
+    return load_json(USERS_FILE, {})
+
 
 def save_users(users):
-    """Сохраняет список пользователей"""
-    with open(USERS_FILE, 'w', encoding='utf-8') as f:
-        json.dump(users, f, ensure_ascii=False, indent=2)
+    save_json(USERS_FILE, users)
+
 
 def load_posts():
-    """Загружает историю постов"""
-    if os.path.exists(POSTS_FILE):
-        try:
-            with open(POSTS_FILE, 'r', encoding='utf-8') as f:
-                return json.load(f)
-        except:
-            pass
-    return {}
+    return load_json(POSTS_FILE, {})
+
 
 def save_posts(posts):
-    """Сохраняет историю постов"""
-    with open(POSTS_FILE, 'w', encoding='utf-8') as f:
-        json.dump(posts, f, ensure_ascii=False, indent=2)
+    save_json(POSTS_FILE, posts)
 
-def update_user_stats(user_id, user_name):
-    """Обновляет статистику пользователей"""
+
+def load_mirror_map():
+    return load_json(MIRROR_MAP_FILE, {})
+
+
+def save_mirror_map(m):
+    save_json(MIRROR_MAP_FILE, m)
+
+
+def get_daily_promo() -> str | None:
+    """Возвращает один промокод на день, если доступно."""
+    stats = load_json(PROMO_STATS_FILE, {})
+    today = datetime.now().strftime("%Y-%m-%d")
+    if stats.get("last_date") != today:
+        stats["last_date"] = today
+        stats["count"] = 0
+    if stats.get("count", 0) >= LABYRINTH_PROMO_LIMIT_PER_DAY:
+        save_json(PROMO_STATS_FILE, stats)
+        return None
+    if not os.path.exists(PROMOS_FILE):
+        return None
+    with open(PROMOS_FILE, "r", encoding="utf-8") as f:
+        lines = [l.strip() for l in f if l.strip()]
+    if not lines:
+        return None
+    promo = lines.pop(0)
+    with open(PROMOS_FILE, "w", encoding="utf-8") as f:
+        f.writelines(l + "\n" for l in lines)
+    stats["count"] = stats.get("count", 0) + 1
+    save_json(PROMO_STATS_FILE, stats)
+    return promo
+
+
+# --------------------------------------------------
+# 5. Плейсхолдеры и сообщения
+# --------------------------------------------------
+def load_messages() -> dict:
+    """
+    Загружает сообщения из `messages.json`.
+    Если файл/папки отсутствуют – создаёт минимальные «заглушки»,
+    чтобы `random.choice()` не падал с `IndexError`. """
+    msgs = load_json("messages.json", {})
+
+    # ---------- Грейтинги ----------
+    if "greetings" not in msgs or not msgs["greetings"]:
+        msgs["greetings"] = [
+            {
+                "first_time": {"text": "Привет, NICKNAMES! Добро пожаловать в лабиринт.", "image": ""},
+                "subsequent": {"text": "Ты уже здесь, NICKNAMES.", "image": ""},
+            }
+        ]
+
+    # ---------- Плейсхолдеры ----------
+    if "placeholders" not in msgs:
+        msgs["placeholders"] = {
+            "NICKNAMES": ["Alex", "Masha", "Ivan"],
+            "NICK_WB": ["Борис", "Кирилл"],
+            "NICK_EP": ["Эльф", "Гном"],
+            "NICK_WINX": ["Воин", "Герой"],
+        }
+
+    # ---------- События 1‑6 + special ----------
+    if "events" not in msgs:
+        msgs["events"] = {}
+    for key in ("1", "2", "3", "4", "5", "6", "special"):
+        if key not in msgs["events"]:
+            msgs["events"][key] = []
+
+        if not msgs["events"][key]:
+            msgs["events"][key] = [
+                {"text": f"Покажено событие {key} (заглушка).", "image": ""}
+            ]
+
+    # ---------- Поражения / победы ----------
+    for key in ("defeat1", "defeat2", "defeat", "victory"):
+        if key not in msgs:
+            msgs[key] = []
+
+        if not msgs[key]:
+            msgs[key] = [
+                {"text": f"Заглушка {key}.", "image": ""},
+            ]
+
+    return msgs
+
+
+# Регулярка для всех поддерживаемых плейсхолдеров (регистр без разницы)
+PMS_RE = re.compile(r"\b(NICK_(?:WB|EP|WINX|NAMES)|NICKNAMES)\b", re.IGNORECASE)
+
+
+def resolve_placeholders(text: str, placeholders: dict) -> str:
+    """Подставляет в строку уникальные значения плейсхолдеров."""
+    matches = list(PMS_RE.finditer(text))
+    if not matches:
+        return text
+    used_values = {}
+    for m in matches:
+        key = m.group(1).upper()
+        pool = placeholders.get(key, [])
+        if not pool:
+            continue
+        val = used_values.get(key)
+        if val is None:
+            val = random.choice(pool)
+            used_values[key] = val
+        text = text[:m.start()] + val + text[m.end():]
+    return text
+
+
+# --------------------------------------------------------------------------
+# 6. Обновление статистики пользователей
+# --------------------------------------------------------------------------
+def update_user_stats(user_id: int, user_name: str):
     users = load_users()
     stats = load_stats()
     if str(user_id) not in users:
         users[str(user_id)] = {
             "name": user_name,
             "first_seen": datetime.now().strftime("%Y-%m-%d %H:%M"),
-            "suggestions_count": 0
+            "suggestions_count": 0,
         }
-        stats['users_count'] = len(users)
-    if 'active_users' not in stats:
-        stats['active_users'] = set()
-    stats['active_users'].add(str(user_id))
+        stats["users_count"] = len(users)
+    stats["active_users"].add(str(user_id))
     save_users(users)
     save_stats(stats)
 
-def update_suggestion_stats(user_id=None):
-    """Обновляет статистику предложек"""
-    stats = load_stats()
-    users = load_users()
-    today = datetime.now().strftime("%Y-%m-%d")
-    if stats['today_date'] != today:
-        stats['today_date'] = today
-        stats['today_suggestions'] = 0
-    stats['total_suggestions'] += 1
-    stats['today_suggestions'] += 1
-    if user_id and str(user_id) in users:
-        users[str(user_id)]['suggestions_count'] = users[str(user_id)].get('suggestions_count', 0) + 1
-    save_stats(stats)
-    save_users(users)
-
-def add_post_to_history(post_id, post_text):
-    """Добавляет пост в историю"""
-    posts = load_posts()
-    posts[post_id] = {
-        "text": post_text[:100] + "..." if len(post_text) > 100 else post_text,
-        "date": datetime.now().strftime("%Y-%m-%d %H:%M"),
-        "comments": 0
-    }
-    save_posts(posts)
 
 async def is_admin(user_id: int) -> bool:
     return user_id in ADMIN_IDS
 
-# ===== ГЕНЕРАТОР КОММЕНТАРИЯ С КНОПКАМИ (БЕЗ ЭМОДЗИ) =====
-def generate_bot_comment_buttons(bot_username):
-    """Возвращает текст + кнопки для комментария под постом — БЕЗ ЭМОДЗИ, КНОПКИ В СТОЛБИК"""
-    text = "Полезные кнопки"
-    buttons = [
-        [InlineKeyboardButton("Предложка", url=f"https://t.me/{bot_username}?start=suggest")],
-        [InlineKeyboardButton("Навигация", url="https://t.me/RialEldChron/711")],
-        [InlineKeyboardButton("Rampage", url="https://t.me/RialEldChron")]
-    ]
-    return text, InlineKeyboardMarkup(buttons)
 
-# ===== ЛОВИМ ЗЕРКАЛО ПОСТА В ЧАТЕ КОММЕНТАРИЕВ =====
+# --------------------------------------------------------------------------
+# 7. Комментарии в чате комментариев
+# --------------------------------------------------------------------------
 async def handle_chat_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Ловим сообщения в чате комментариев, чтобы найти зеркала постов из канала"""
     try:
-        if not update.message:
+        if not update.message or update.message.chat.id != COMMENTS_CHAT_ID:
             return
-        if update.message.chat.id != COMMENTS_CHAT_ID:
-            return
-        if not getattr(update.message, 'is_automatic_forward', False):
+        if not getattr(update.message, "is_automatic_forward", False):
             return
 
         channel_post_id = None
-        if hasattr(update.message, 'forward_origin') and update.message.forward_origin:
+        if hasattr(update.message, "forward_origin") and update.message.forward_origin:
             origin = update.message.forward_origin
-            if hasattr(origin, 'chat') and origin.chat and origin.chat.id == CHANNEL_CHAT_ID:
-                if hasattr(origin, 'message_id'):
+            if hasattr(origin, "chat") and origin.chat and origin.chat.id == CHANNEL_CHAT_ID:
+                if hasattr(origin, "message_id"):
                     channel_post_id = origin.message_id
 
         if not channel_post_id:
-            channel_post_id = getattr(update.message, 'forward_from_message_id', None)
+            channel_post_id = getattr(update.message, "forward_from_message_id", None)
 
         chat_message_id = update.message.message_id
-
         if not channel_post_id:
-            print(f"⚠️ Не удалось определить ID оригинального поста для сообщения {chat_message_id}")
+            logger.warning(
+                f"⚠️ Не удалось определить ID оригинального поста для сообщения {chat_message_id}"
+            )
             return
 
         mirror_map = load_mirror_map()
         mirror_map[str(channel_post_id)] = chat_message_id
         save_mirror_map(mirror_map)
-        print(f"🔗 Сохранена связка: пост в канале {channel_post_id} → сообщение в чате комментариев {chat_message_id}")
+        logger.info(
+            f"🔗 Сохранена связка: пост в канале {channel_post_id} → сообщение в чате комментариев {chat_message_id}"
+        )
 
-        pending_comments = context.bot_data.get('pending_comments', {})
+        pending_comments = context.bot_data.get("pending_comments", {})
         key = str(channel_post_id)
         if key in pending_comments:
             data = pending_comments[key]
-            comment_text = data['text']
-            reply_markup = data['reply_markup']
+            comment_text = data["text"]
+            reply_markup = data["reply_markup"]
             try:
                 await context.bot.send_message(
                     chat_id=COMMENTS_CHAT_ID,
                     text=comment_text,
                     reply_markup=reply_markup,
-                    parse_mode='HTML',
-                    reply_to_message_id=chat_message_id
+                    parse_mode="HTML",
+                    reply_to_message_id=chat_message_id,
                 )
-                print(f"✅ Комментарий отправлен на зеркало {chat_message_id}")
+                logger.info(f"✅ Комментарий отправлен на зеркало {chat_message_id}")
                 del pending_comments[key]
-                context.bot_data['pending_comments'] = pending_comments
+                context.bot_data["pending_comments"] = pending_comments
             except Exception as e:
-                print(f"❌ Не удалось отправить комментарий: {e}")
-        else:
-            print(f"ℹ️ Комментарий для поста {channel_post_id} уже был отправлен или не требовался")
-
+                logger.error(f"❌ Не удалось отправить комментарий: {e}")
     except Exception as e:
-        print(f"❌ Ошибка в handle_chat_message: {e}")
+        logger.error(f"❌ Ошибка в handle_chat_message: {e}")
 
-# ===== СЧЁТЧИК СООБЩЕНИЙ В ЧАТЕ ЗЕРКАЛ (КОММЕНТАРИЕВ) ЗА 7 ДНЕЙ =====
+
+async def handle_channel_post(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.channel_post or update.channel_post.chat.id != CHANNEL_CHAT_ID:
+        return
+    post_message = update.channel_post
+    post_text = post_message.text or post_message.caption or "Медиа‑пост"
+    bot = await context.bot.get_me()
+    bot_username = bot.username
+    comment_text, reply_markup = generate_bot_comment_buttons(bot_username)
+
+    if "pending_comments" not in context.bot_data:
+        context.bot_data["pending_comments"] = {}
+    context.bot_data[str(post_message.message_id)] = {
+        "text": comment_text,
+        "reply_markup": reply_markup,
+    }
+
+    add_post_to_history(post_message.message_id, post_text)
+    stats = load_stats()
+    stats["published"] = stats.get("published", 0) + 1
+    save_stats(stats)
+
+
+def generate_bot_comment_buttons(bot_username: str):
+    text = "Полезные кнопки"
+    buttons = [
+        [
+            InlineKeyboardButton(
+                "Предложка",
+                url=f"https://t.me/{bot_username}?start=suggest",
+            )
+        ],
+        [InlineKeyboardButton("Навигация", url="https://t.me/RialEldChron/711")],
+        [InlineKeyboardButton("Rampage", url="https://t.me/RialEldChron")],
+    ]
+    return text, InlineKeyboardMarkup(buttons)
+
+
+def add_post_to_history(post_id: int, post_text: str):
+    posts = load_posts()
+    posts[post_id] = {
+        "text": post_text[:100] + ("..." if len(post_text) > 100 else ""),
+        "date": datetime.now().strftime("%Y-%m-%d %H:%M"),
+        "comments": 0,
+    }
+    save_posts(posts)
+
+
+# --------------------------------------------------------------------------
+# 8. Счётчик чата комментариев
+# --------------------------------------------------------------------------
 async def handle_group_message_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Счётчик сообщений пользователей в COMMENTS_CHAT_ID по дням (YYYY-MM-DD)."""
     try:
-        if not update.message:
+        if not update.message or update.message.chat.id != COMMENTS_CHAT_ID:
             return
-        if update.message.chat.id != COMMENTS_CHAT_ID:
-            return
-
         user = update.effective_user
         if not user:
             return
@@ -271,613 +401,692 @@ async def handle_group_message_stats(update: Update, context: ContextTypes.DEFAU
         u = users.setdefault(str(user.id), {
             "name": user.first_name,
             "first_seen": datetime.now().strftime("%Y-%m-%d %H:%M"),
-            "suggestions_count": 0
+            "suggestions_count": 0,
         })
-        if not u.get("name"):
-            u["name"] = user.first_name
-
-        today = datetime.now().strftime('%Y-%m-%d')
-        msg_counts = u.setdefault('msg_counts', {})
+        u["name"] = u.get("name") or user.first_name
+        today = datetime.now().strftime("%Y-%m-%d")
+        msg_counts = u.setdefault("msg_counts", {})
         msg_counts[today] = msg_counts.get(today, 0) + 1
         save_users(users)
     except Exception as e:
         logger.error(f"Ошибка в handle_group_message_stats: {e}")
 
-# ===== ОБРАБОТКА ПОСТА ИЗ КАНАЛА — БЕЗ ФОНОВОЙ ЗАДАЧИ =====
-async def handle_channel_post(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Обрабатывает посты из канала и планирует комментарий (без дублей)"""
+
+# --------------------------------------------------------------------------
+# 9. Подпись и предложки
+# --------------------------------------------------------------------------
+def update_suggestion_stats(user_id: int | None = None):
+    """Обновление статистики предложений."""
+    stats = load_stats()
+    users = load_users()
+    today = datetime.now().strftime("%Y-%m-%d")
+    if stats.get("today_date") != today:
+        stats["today_date"] = today
+        stats["today_suggestions"] = 0
+    stats["total_suggestions"] += 1
+    stats["today_suggestions"] += 1
+    if user_id and str(user_id) in users:
+        users[str(user_id)]["suggestions_count"] = users[str(user_id)].get("suggestions_count", 0) + 1
+    save_stats(stats)
+    save_users(users)
+
+
+async def handle_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.message or not update.effective_user:
+        return
+    if update.message.chat.type != "private":
+        return
+    user = update.effective_user
+    user_id = user.id
+    if not context.user_data.get("awaiting_suggestion", False):
+        return
+    update_suggestion_stats(user_id)
+    media_type = "ФОТО"
+    if update.message.video:
+        media_type = "ВИДЕО"
+    elif update.message.document:
+        media_type = "ДОКУМЕНТ"
+    report_text = (
+        f"📥 НОВАЯ ПРЕДЛОЖКА (МЕДИА)\n"
+        f"├─ От: {user.first_name} (@{user.username or 'без username'})\n"
+        f"├─ ID: {user.id}\n"
+        f"└─ Тип: {media_type}\n"
+    )
     try:
-        if not update.channel_post:
-            return
-        if update.channel_post.chat.id != CHANNEL_CHAT_ID:
-            return
-
-        post_message = update.channel_post
-        post_text = post_message.text or post_message.caption or "Медиа-пост"
-        print(f"📨 Новый пост в канале: {post_message.message_id}")
-
-        bot = await context.bot.get_me()
-        bot_username = bot.username
-        comment_text, reply_markup = generate_bot_comment_buttons(bot_username)
-
-        if 'pending_comments' not in context.bot_data:
-            context.bot_data['pending_comments'] = {}
-
-        context.bot_data['pending_comments'][str(post_message.message_id)] = {
-            'text': comment_text,
-            'reply_markup': reply_markup
-        }
-
-        add_post_to_history(post_message.message_id, post_text)
-        stats = load_stats()
-        stats['published'] = stats.get('published', 0) + 1
-        save_stats(stats)
-        print(f"⏳ Комментарий для поста {post_message.message_id} поставлен в очередь")
-
+        await context.bot.send_message(
+            chat_id=ADMIN_CHAT_ID,
+            text=report_text,
+            message_thread_id=SUGGESTION_TOPIC_ID,
+        )
+        await update.message.forward(
+            chat_id=ADMIN_CHAT_ID,
+            message_thread_id=SUGGESTION_TOPIC_ID,
+        )
+        await context.bot.send_message(
+            chat_id=ADMIN_CHAT_ID,
+            text="─" * 40,
+            message_thread_id=SUGGESTION_TOPIC_ID,
+        )
+        await update.message.reply_text(
+            "✅ Получил! Твоя предложка отправлена модераторам. Спасибо! 💫",
+            reply_markup=USER_KEYBOARD,
+        )
+        context.user_data["awaiting_suggestion"] = False
     except Exception as e:
-        print(f"❌ Ошибка при обработке поста из канала: {e}")
+        logger.error(f"Ошибка в handle_media: {e}")
+        await update.message.reply_text(
+            "❌ Произошла ошибка при отправке. Попробуйте позже."
+        )
 
-# ===== ОТЛАДОЧНАЯ ФУНКЦИЯ =====
+
+async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.message or not update.effective_user:
+        return
+    if update.message.chat.type != "private":
+        return
+    user = update.effective_user
+    user_id = user.id
+    msg_text = update.message.text
+
+    # Админ‑кнопка «🔐 Я администратор»
+    if msg_text == "🔐 Я администратор":
+        if await is_admin(user_id):
+            await update.message.reply_text(
+                "✅ <b>Доступ подтвержден!</b>\nДобро пожаловать в панель управления!",
+                parse_mode="HTML",
+                reply_markup=ADMIN_KEYBOARD,
+            )
+        else:
+            await update.message.reply_text(
+                "❌ <b>Доступ запрещен</b>\nУ вас нет прав администратора.",
+                parse_mode="HTML",
+                reply_markup=USER_KEYBOARD,
+            )
+        return
+
+    if msg_text == "Обычный режим":
+        await update.message.reply_text(
+            "🔓 <b>Переключено в обычный режим</b>", parse_mode="HTML", reply_markup=USER_KEYBOARD
+        )
+        return
+
+    # Запуск предложений
+    if msg_text == "Предложить новость":
+        context.user_data["awaiting_suggestion"] = True
+        await update.message.reply_text("📝 Отправьте мне свой контент (текст, скрин или фрапс)!")
+        return
+
+    if msg_text == "Помощь":
+        await update.message.reply_text(
+            "ℹ️ <b>Как пользоваться ботом:</b>\n• Нажмите 'Предложить новость'\n• Отправьте текст, фото или видео\n• Я перешлю его администраторам\n📌 Контент должен быть уникальным и интересным!",
+            parse_mode="HTML",
+        )
+        return
+
+    # Игра «Лабиринт» – передаём команду ConversationHandler
+    if msg_text == "Играть в Лабиринт":
+        return
+
+    # Доп. команды админов
+    if await is_admin(user_id):
+        if msg_text == "Статистика":
+            await show_statistics(update, context)
+            return
+        elif msg_text == "Пользователи":
+            await show_users(update, context)
+            return
+        elif msg_text == "Настройки":
+            await show_settings(update, context)
+            return
+        elif msg_text == "Создать пост":
+            return await create_post(update, context)
+
+    # Текстовый ввод в режиме предложки
+    if context.user_data.get("awaiting_suggestion", False):
+        try:
+            update_suggestion_stats(user_id)
+            report_text = (
+                f"📥 НОВАЯ ПРЕДЛОЖКА\n"
+                f"├─ От: {user.first_name} (@{user.username or 'без username'})\n"
+                f"├─ ID: {user.id}\n"
+                f"└─ Тип: ТЕКСТ\n"
+                f"👇 СОДЕРЖИМОЕ:\n{msg_text}\n"
+            )
+            await context.bot.send_message(
+                chat_id=ADMIN_CHAT_ID,
+                text=report_text,
+                message_thread_id=SUGGESTION_TOPIC_ID,
+            )
+            await context.bot.send_message(
+                chat_id=ADMIN_CHAT_ID,
+                text="─" * 40,
+                message_thread_id=SUGGESTION_TOPIC_ID,
+            )
+            await update.message.reply_text(
+                "✅ Получил! Твоя предложка отправлена модераторам. Спасибо! 💫",
+                reply_markup=USER_KEYBOARD,
+            )
+            context.user_data["awaiting_suggestion"] = False
+        except Exception as e:
+            logger.error(f"Ошибка в handle_message: {e}")
+            await update.message.reply_text("❌ Произошла ошибка. Попробуйте позже.")
+        return
+
+
+# --------------------------------------------------------------------------
+# 10. Старт и отладка
+# --------------------------------------------------------------------------
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.message or not update.effective_user:
+        return
+    if update.message.chat.type != "private":
+        return
+    user_id = update.effective_user.id
+    user_name = update.effective_user.first_name
+    update_user_stats(user_id, user_name)
+    welcome_text = f"Привет, {user_name}! 👋\nЯ бот для предложки контента. Выбери действие:"
+    await update.message.reply_text(welcome_text, reply_markup=USER_KEYBOARD)
+
+
 async def debug_info(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.effective_user or not await is_admin(update.effective_user.id):
         return
     mirror_map = load_mirror_map()
-    debug_text = f"""
-📊 <b>Информация для отладки:</b>
-🔧 ID канала: <code>{CHANNEL_CHAT_ID}</code>
-🔧 ID чата комментариев: <code>{COMMENTS_CHAT_ID}</code>
-🔧 ID группы предложек: <code>{GROUP_CHAT_ID}</code>
-🔧 Username канала: @{CHANNEL_USERNAME}
-🔗 Сохранённые связки (последние 5):
-"""
-    count = 0
+    debug_text = (
+        "📊 <b>Информация для отладки:</b>\n"
+        f"🔧 ID канала: <code>{CHANNEL_CHAT_ID}</code>\n"
+        f"🔧 ID чата комментариев: <code>{COMMENTS_CHAT_ID}</code>\n"
+        f"🔧 ID группы предложек: <code>{GROUP_CHAT_ID}</code>\n"
+        f"🔧 Username канала: @{CHANNEL_USERNAME}\n"
+        f"🔗 Сохранённые связки (последние 5):\n"
+    )
     for k, v in list(mirror_map.items())[-5:]:
         debug_text += f"\n• Канал {k} → Чат {v}"
-        count += 1
-    if count == 0:
+    if not mirror_map:
         debug_text += "\nПока нет сохранённых связок"
-    await update.message.reply_text(debug_text, parse_mode='HTML')
+    await update.message.reply_text(debug_text, parse_mode="HTML")
 
-# ===== ОСНОВНЫЕ ФУНКЦИИ =====
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Обработчик команды /start — показывает стандартную клавиатуру ВСЕМ пользователям"""
-    if not update.message or not update.effective_user:
-        return
-    if update.message.chat.type != 'private':
-        return
 
-    user_id = update.effective_user.id
-    user_name = update.effective_user.first_name
-    update_user_stats(user_id, user_name)
-
-    welcome_text = f"Привет, {user_name}! 👋\nЯ бот для предложки контента. Выбери действие:"
-    await update.message.reply_text(welcome_text, reply_markup=USER_KEYBOARD)
-
-# ===== ИГРА "ЛАБИРИНТ" =====
-EVENTS_DATA = {
-    'neutral': [
-        {"text": "Тихий коридор тянется вперёд. Ничего не происходит.", "image": "neutral_1.jpg"},
-        {"text": "Вы идёте вдоль сырой стены. Кажется спокойно.", "image": "neutral_2.jpg"}
-    ],
-    'damage': [
-        {"text": "Незаметная ловушка срабатывает. Вы получаете урон.", "image": "damage_1.jpg"},
-        {"text": "Из тьмы прилетает камень. Больно.", "image": "damage_2.jpg"},
-        {"text": "Пол оседает. Падение причиняет вред.", "image": "damage_3.jpg"}
-    ],
-    'heal': [
-        {"text": "Находите место, где можно перевести дух. Чувствуете себя лучше.", "image": "heal_1.jpg"},
-        {"text": "Светлый участок пути придаёт сил.", "image": "heal_2.jpg"}
-    ],
-    'treasure': [
-        {"text": "Перед вами древний сундук. Что делать?", "image": "treasure.jpg"}
-    ]
-}
-
-# Вероятности типов событий
-EVENT_WEIGHTS = [0.31, 0.31, 0.31, 0.07]  # neutral, damage, heal, treasure
-DAMAGE_DISTRIBUTION = [0.5, 0.3, 0.2]     # потеря 1/2/3
-HEAL_DISTRIBUTION = [0.6, 0.4]            # восстановление 1/2
-
-# Состояние игры
-class GameState:
-    def __init__(self):
-        self.user_states = {}
-
-    def init_user(self, user_id):
-        self.user_states[user_id] = {
-            'hp': 10,
-            'step': 0,
-            'message_history': [],
-            'last_played': datetime.now().strftime('%Y-%m-%d'),
-            'max_steps': 10,
-            'used_events': set(),
-            'treasure_pending': False
-        }
-
-    def delete_progress(self, user_id):
-        if user_id in self.user_states:
-            del self.user_states[user_id]
-
-game_state = GameState()
-
-# Получение промокода
-def get_promo_code():
-    try:
-        with open(PROMOS_FILE, 'r', encoding='utf-8') as f:
-            lines = f.readlines()
-        if not lines:
-            return None
-        promo = lines[0].strip()
-        with open(PROMOS_FILE, 'w', encoding='utf-8') as f:
-            f.writelines(lines[1:])
-        return promo
-    except FileNotFoundError:
-        return None
-
-# ===== ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ДЛЯ ОПЫТА И СТАТИСТИКИ ИГРЫ =====
-def is_experienced_player(user_id: int) -> bool:
-    users = load_users()
-    u = users.get(str(user_id), {})
-    wins = u.get('labyrinth_wins', 0)
-    plays = u.get('labyrinth_plays', 0)
-    return wins >= 1 or plays >= 5
-
-def increment_user_counter(user_id: int, field: str, inc: int = 1):
-    users = load_users()
-    u = users.setdefault(str(user_id), {})
-    u[field] = u.get(field, 0) + inc
-    save_users(users)
-
-# Удаление сообщений
-async def delete_messages(update: Update, context: ContextTypes.DEFAULT_TYPE, user_id):
-    if user_id in game_state.user_states:
-        for msg_id in game_state.user_states[user_id]['message_history']:
-            try:
-                await context.bot.delete_message(
-                    chat_id=update.effective_chat.id,
-                    message_id=msg_id
-                )
-            except Exception as e:
-                logger.error(f"Error deleting message: {e}")
-        game_state.user_states[user_id]['message_history'] = []
-
-# Запуск игры
-async def start_labyrinth_game(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    # Ограничение: 1 игра в сутки (можно отключить флагом LABYRINTH_DAILY_LIMIT_ENABLED)
-    users = load_users()
-    today = datetime.now().strftime('%Y-%m-%d')
-    last = users.get(str(user_id), {}).get('last_labyrinth')
-    if LABYRINTH_DAILY_LIMIT_ENABLED and last == today:
-        await update.message.reply_text("Вы уже играли сегодня. Попробуйте завтра.")
-        return ConversationHandler.END
-
-    await delete_messages(update, context, user_id)
-    game_state.init_user(user_id)
-    increment_user_counter(user_id, 'labyrinth_plays', 1)
-    msg = await update.message.reply_text(
-        "Добро пожаловать в лабиринт. Ваше здоровье: 10/10. Выберите направление:",
-        reply_markup=ReplyKeyboardMarkup([["Налево", "Прямо", "Направо", "В меню"]], one_time_keyboard=True)
-    )
-    game_state.user_states[user_id]['message_history'].append(msg.message_id)
-    return LABYRINTH_GAME
-
-# Обработка выбора
-async def handle_labyrinth_choice(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    state = game_state.user_states.get(user_id)
-
-    # Защита от поврежденного состояния
-    if not state or 'step' not in state or 'hp' not in state:
-        logger.warning(f"Состояние игры для пользователя {user_id} повреждено. Перезапуск.")
-        return await start_labyrinth_game(update, context)
-
-    user_message = update.message.text
-
-    # Выход в меню
-    if user_message == "В меню":
-        await delete_messages(update, context, user_id)
-        game_state.delete_progress(user_id)
-        await update.message.reply_text("Вы вернулись в главное меню.", reply_markup=USER_KEYBOARD)
-        return ConversationHandler.END
-
-    # Развилка уникального события "сокровище"
-    if state.get('treasure_pending'):
-        if user_message == "Пройти мимо":
-            state['treasure_pending'] = False
-            state['step'] += 1
-        elif user_message == "Забрать сокровище":
-            await delete_messages(update, context, user_id)
-            users = load_users()
-            users.setdefault(str(user_id), {})['last_labyrinth'] = datetime.now().strftime('%Y-%m-%d')
-            save_users(users)
-            game_state.delete_progress(user_id)
-            image_path = os.path.join("images", "treasure.jpg")
-            if os.path.exists(image_path):
-                await update.message.reply_photo(photo=open(image_path, 'rb'), caption="Вы забрали сокровище. Игра завершена без промокода.", reply_markup=USER_KEYBOARD)
-            else:
-                await update.message.reply_text("Вы забрали сокровище. Игра завершена без промокода.", reply_markup=USER_KEYBOARD)
-            return ConversationHandler.END
-        else:
-            return ConversationHandler.END if user_message == "В меню" else LABYRINTH_GAME
-
-    # Проверка валидного выбора направления
-    if user_message not in ("Налево", "Прямо", "Направо"):
-        await update.message.reply_text("Выберите доступный вариант: Налево, Прямо или Направо.")
-        return LABYRINTH_GAME
-
-    # Выбор события по весам, без повторов изображений за сессию
-    def pick_event():
-        # Базовый выбор по весам
-        types = ['neutral', 'damage', 'heal', 'treasure']
-        chosen = random.choices(types, weights=EVENT_WEIGHTS, k=1)[0]
-
-        # Механика предвидения: опытный 45%, новичок 24%
-        experienced = is_experienced_player(user_id)
-        foresee_prob = 0.45 if experienced else 0.24
-        if chosen == 'damage' and random.random() < foresee_prob:
-            # Заменяем опасное событие на безопасное (neutral/heal) для повышения шанса выживания
-            chosen = random.choices(['neutral', 'heal'], weights=[0.5, 0.5], k=1)[0]
-
-        used = state.get('used_events', set())
-        pool = [e for e in EVENTS_DATA[chosen] if e['image'] not in used]
-        if not pool:
-            pool = EVENTS_DATA[chosen][:]
-        return chosen, random.choice(pool)
-
-    etype, edata = pick_event()
-    state['used_events'].add(edata['image'])
-
-    # Применение эффектов и формирование поясняющего текста
-    effect_note = ""
-    if etype == 'damage':
-        dmg = random.choices([1, 2, 3], weights=DAMAGE_DISTRIBUTION, k=1)[0]
-        state['hp'] -= dmg
-        effect_note = f"\nПотеря здоровья: -{dmg} HP"
-    elif etype == 'heal':
-        heal = random.choices([1, 2], weights=HEAL_DISTRIBUTION, k=1)[0]
-        state['hp'] += heal
-        effect_note = f"\nВосстановление здоровья: +{heal} HP"
-
-    # Поражение
-    if state['hp'] <= 0:
-        await delete_messages(update, context, user_id)
-        users = load_users()
-        users.setdefault(str(user_id), {})['last_labyrinth'] = datetime.now().strftime('%Y-%m-%d')
-        save_users(users)
-        game_state.delete_progress(user_id)
-        image_path = os.path.join("images", "lose.jpg")
-        if os.path.exists(image_path):
-            await update.message.reply_photo(photo=open(image_path, 'rb'), caption="Вы погибли в лабиринте.", reply_markup=USER_KEYBOARD)
-        else:
-            await update.message.reply_text("Вы погибли в лабиринте.", reply_markup=USER_KEYBOARD)
-        return ConversationHandler.END
-
-    # Уникальное событие сокровища
-    if etype == 'treasure':
-        state['treasure_pending'] = True
-        keyboard = [["Пройти мимо", "Забрать сокровище"], ["В меню"]]
-        image_path = os.path.join("images", edata.get("image", ""))
-        if edata.get("image") and os.path.exists(image_path):
-            msg = await update.message.reply_photo(photo=open(image_path, 'rb'), caption=edata["text"], reply_markup=ReplyKeyboardMarkup(keyboard, one_time_keyboard=True))
-        else:
-            msg = await update.message.reply_text(edata["text"], reply_markup=ReplyKeyboardMarkup(keyboard, one_time_keyboard=True))
-        state['message_history'].append(msg.message_id)
-        return LABYRINTH_GAME
-
-    # Шаг засчитываем
-    state['step'] += 1
-
-    # Победа
-    if state['step'] >= state['max_steps']:
-        await delete_messages(update, context, user_id)
-        users = load_users()
-        users.setdefault(str(user_id), {})['last_labyrinth'] = datetime.now().strftime('%Y-%m-%d')
-        save_users(users)
-        increment_user_counter(user_id, 'labyrinth_wins', 1)
-        game_state.delete_progress(user_id)
-        promo = get_promo_code()
-        text = f"Вы прошли лабиринт. Промокод: {promo}" if promo else "Вы прошли лабиринт, но промокоды закончились."
-        image_path = os.path.join("images", "win.jpg")
-        if os.path.exists(image_path):
-            await update.message.reply_photo(photo=open(image_path, 'rb'), caption=text, reply_markup=USER_KEYBOARD)
-        else:
-            await update.message.reply_text(text, reply_markup=USER_KEYBOARD)
-        return ConversationHandler.END
-
-    # Следующая итерация
-    keyboard = [["Налево", "Прямо", "Направо", "В меню"]]
-    status = f"Здоровье: {state['hp']}/10"
-    image_path = os.path.join("images", edata.get("image", ""))
-    caption = f"{edata['text']}{effect_note}\n\n{status}"
-    if edata.get("image") and os.path.exists(image_path):
-        msg = await update.message.reply_photo(photo=open(image_path, 'rb'), caption=caption, reply_markup=ReplyKeyboardMarkup(keyboard, one_time_keyboard=True))
-    else:
-        msg = await update.message.reply_text(caption, reply_markup=ReplyKeyboardMarkup(keyboard, one_time_keyboard=True))
-    state['message_history'].append(msg.message_id)
-    return LABYRINTH_GAME
-
-# ⚠️ ЗАГЛУШКИ ДЛЯ ОТСУТСТВУЮЩИХ ФУНКЦИЙ — теперь они РАБОТАЮТ
 async def show_statistics(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # Доступ только для админов
     if not update.effective_user or not await is_admin(update.effective_user.id):
         return
-    # Считаем сообщения за последние 7 дней по COMMENTS_CHAT_ID
     users = load_users()
-    cutoff = (datetime.now() - timedelta(days=6)).strftime('%Y-%m-%d')
-    # Собираем суммы
-    ranking = []  # (count, user_id, name)
+    cutoff = (datetime.now() - timedelta(days=6)).strftime("%Y-%m-%d")
+    ranking = []
     for uid, u in users.items():
-        msg_counts = u.get('msg_counts', {})
-        total7 = 0
-        for day, cnt in msg_counts.items():
-            if day >= cutoff:
-                try:
-                    total7 += int(cnt)
-                except Exception:
-                    continue
+        msg_counts = u.get("msg_counts", {})
+        total7 = sum(int(cnt) for day, cnt in msg_counts.items() if day >= cutoff)
         if total7 > 0:
-            ranking.append((total7, int(uid), u.get('name') or str(uid)))
+            ranking.append((total7, int(uid), u.get("name") or uid))
     ranking.sort(reverse=True, key=lambda x: x[0])
-
     if not ranking:
         await update.message.reply_text("За последние 7 дней нет сообщений в чате.")
         return
-
-    # Готовим вывод
     lines = ["Статистика чата за 7 дней (чат комментариев):"]
     for idx, (cnt, uid, name) in enumerate(ranking, start=1):
-        display = f"{name} (id {uid})" if name else f"id {uid}"
-        lines.append(f"{idx}. {display}: {cnt}")
-    text = "\n".join(lines[:100])
-    await update.message.reply_text(text)
+        lines.append(f"{idx}. {name} (id {uid}): {cnt}")
+    await update.message.reply_text("\n".join(lines[:100]))
+
 
 async def show_users(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("👥 Список пользователей временно недоступен.")
 
+
 async def show_settings(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("⚙️ Настройки временно недоступны.")
 
-# ✅ ВОССТАНОВЛЕНА ФУНКЦИЯ СОЗДАНИЯ ПОСТА
+
+# --------------------------------------------------------------------------
+# 11. Создание поста
+# --------------------------------------------------------------------------
 async def create_post(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # Разрешаем создание постов только администраторам
     if not update.effective_user or not await is_admin(update.effective_user.id):
         await update.message.reply_text("❌ У вас нет прав для создания постов.")
         return ConversationHandler.END
     await update.message.reply_text("📝 Отправьте текст поста:")
     return GET_TEXT
 
+
 async def get_post_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data['post_text'] = update.message.text
-    await update.message.reply_text("📎 Теперь отправьте кнопки в формате:\n`Кнопка 1 - https://example.com`\nКаждая кнопка с новой строки.\nИли отправьте 'Без кнопок'.")
+    context.user_data["post_text"] = update.message.text
+    await update.message.reply_text(
+        "📎 Теперь отправьте кнопки в формате:\n"
+        "`Кнопка 1 - https://example.com`\n"
+        "Каждая кнопка с новой строки.\n"
+        "Или отправьте 'Без кнопок'.",
+        parse_mode="HTML",
+    )
     return GET_BUTTONS
 
-async def process_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = context.user_data.get('post_text', 'Текст не задан')
-    buttons_text = update.message.text
 
+async def process_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = context.user_data.get("post_text", "Текст не задан")
+    buttons_text = update.message.text
     reply_markup = None
-    if buttons_text.strip().lower() != 'без кнопок':
+    if buttons_text.strip().lower() != "без кнопок":
         try:
             button_rows = []
-            for line in buttons_text.split('\n'):
-                if ' - ' in line:
-                    label, url = line.split(' - ', 1)
-                    button_rows.append([InlineKeyboardButton(label.strip(), url=url.strip())])
+            for line in buttons_text.split("\n"):
+                if " - " in line:
+                    label, url = line.split(" - ", 1)
+                    button_rows.append(
+                        [InlineKeyboardButton(label.strip(), url=url.strip())]
+                    )
             if button_rows:
                 reply_markup = InlineKeyboardMarkup(button_rows)
         except Exception:
             await update.message.reply_text("❌ Ошибка в формате кнопок. Попробуйте снова.")
             return GET_BUTTONS
-
     try:
-        sent_message = await context.bot.send_message(
+        sent = await context.bot.send_message(
             chat_id=CHANNEL_CHAT_ID,
             text=text,
             reply_markup=reply_markup,
-            disable_web_page_preview=False
+            disable_web_page_preview=False,
         )
-        add_post_to_history(sent_message.message_id, text)
+        add_post_to_history(sent.message_id, text)
         await update.message.reply_text("✅ Пост успешно опубликован в канале!")
     except Exception as e:
         await update.message.reply_text(f"❌ Ошибка при публикации: {str(e)}")
-
     return ConversationHandler.END
+
 
 async def cancel_creation(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("❌ Создание поста отменено.")
     return ConversationHandler.END
 
-# 🚨 КРИТИЧЕСКОЕ ИСПРАВЛЕНИЕ: handle_media — только после "Предложить новость"
-async def handle_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Обработка медиа — ТОЛЬКО если пользователь нажал 'Предложить новость'"""
-    if not update.message or not update.effective_user:
-        return
-    if update.message.chat.type != 'private':
-        return
 
-    user = update.effective_user
-    user_id = user.id
+# --------------------------------------------------------------------------
+# 12. Лабиринт – логика и состояние
+# --------------------------------------------------------------------------
+class LabyrinthState:
+    def __init__(self, user_id: int):
+        self.user_id = user_id
+        self.hp = LABYRINTH_START_HP
+        self.step = 0
+        self.messages = []  # message_id, которые нужно удалить
+        self.last_labyrinth = None  # YYYY‑MM‑DD
+        self.wins = 0
+        self.loses = 0
 
-    # ✅ Проверяем, что пользователь активировал режим предложки
-    if not context.user_data.get('awaiting_suggestion', False):
-        return  # Игнорируем, если не в режиме предложки
 
-    update_suggestion_stats(user.id)
+def load_laby_state(uid: int) -> LabyrinthState:
+    users = load_users()
+    u = users.get(str(uid), {})
+    state = LabyrinthState(uid)
+    state.hp = u.get("labyrinth_hp", LABYRINTH_START_HP)
+    state.step = u.get("labyrinth_step", 0)
+    state.last_labyrinth = u.get("last_labyrinth")
+    state.wins = u.get("labyrinth_wins", 0)
+    state.loses = u.get("labyrinth_loses", 0)
+    return state
 
-    media_type = "ФОТО"
-    if update.message.video:
-        media_type = "ВИДЕО"
-    elif update.message.document:
-        media_type = "ДОКУМЕНТ"
 
-    report_text = f"""
-📥 НОВАЯ ПРЕДЛОЖКА (МЕДИА)
-├─ От: {user.first_name} (@{user.username or 'без username'})
-├─ ID: {user.id}
-└─ Тип: {media_type}
-"""
+def save_laby_state(state: LabyrinthState):
+    users = load_users()
+    u = users.get(str(state.user_id), {})
+    u.update(
+        {
+            "labyrinth_hp": state.hp,
+            "labyrinth_step": state.step,
+            "last_labyrinth": state.last_labyrinth,
+            "labyrinth_wins": state.wins,
+            "labyrinth_loses": state.loses,
+        }
+    )
+    users[str(state.user_id)] = u
+    save_users(users)
 
-    try:
-        print(f"📤 Отправляем в группу {ADMIN_CHAT_ID}, тема {SUGGESTION_TOPIC_ID}")
-        await context.bot.send_message(chat_id=ADMIN_CHAT_ID, text=report_text, message_thread_id=SUGGESTION_TOPIC_ID)
-        await update.message.forward(chat_id=ADMIN_CHAT_ID, message_thread_id=SUGGESTION_TOPIC_ID)
-        await context.bot.send_message(chat_id=ADMIN_CHAT_ID, text="─" * 40, message_thread_id=SUGGESTION_TOPIC_ID)
-        await update.message.reply_text("✅ Получил! Твоя предложка отправлена модераторам. Спасибо! 💫", reply_markup=USER_KEYBOARD)
-        context.user_data['awaiting_suggestion'] = False  # Сбрасываем флаг
-    except Exception as e:
-        print(f"Ошибка в handle_media: {e}")
-        await update.message.reply_text("❌ Произошла ошибка при отправке. Попробуйте позже.")
 
-# Обработчик сообщений — ✅ Только после "Предложить новость"
-async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not update.message or not update.effective_user:
-        return
-    if update.message.chat.type != 'private':
-        return
+# --------------------------------------------------------------------------
+# 13. Helper для отправки сообщения и записи ID
+# --------------------------------------------------------------------------
+async def send_and_record(update: Update, context: ContextTypes.DEFAULT_TYPE,
+                          state: LabyrinthState, text: str,
+                          image: str | None = None,
+                          reply_markup=None, parse_mode="HTML"):
+    msg_id = await send_message_with_cleanup(
+        update, context, text, image, reply_markup, parse_mode
+    )
+    if state:
+        state.messages.append(msg_id)
+    return msg_id
 
+
+# --------------------------------------------------------------------------
+# 14. Функции правил лабиринта
+# --------------------------------------------------------------------------
+async def start_labyrinth(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
-    user_message = update.message
+    state = load_laby_state(user_id)
 
-    # ✅ Обработка кнопки "🔐 Я администратор" — доступ только для админов
-    if user_message.text == "🔐 Я администратор":
-        if await is_admin(user_id):
-            await update.message.reply_text("✅ <b>Доступ подтвержден!</b>\nДобро пожаловать в панель управления!", parse_mode='HTML', reply_markup=ADMIN_KEYBOARD)
-        else:
-            await update.message.reply_text("❌ <b>Доступ запрещен</b>\nУ вас нет прав администратора.", parse_mode='HTML', reply_markup=USER_KEYBOARD)
+    today = datetime.now().strftime("%Y-%m-%d")
+    if LABYRINTH_DAILY_LIMIT_ENABLED and state.last_labyrinth == today:
+        await update.message.reply_text("Вы уже играли сегодня. Подождите, пока сменится день.")
+        return ConversationHandler.END
+
+    # Reset state
+    state.hp = LABYRINTH_START_HP
+    state.step = 0
+    state.last_labyrinth = today
+    state.messages = []
+    save_laby_state(state)
+
+    msgs = load_messages()
+    greet = msgs["greetings"][0]
+    if state.wins + state.loses == 0:
+        greet_text, greet_img = greet["first_time"]["text"], greet["first_time"]["image"]
+    else:
+        greet_text, greet_img = greet["subsequent"]["text"], greet["subsequent"]["image"]
+
+    greet_text = f"💪 HP: {state.hp}\n{resolve_placeholders(greet_text, msgs['placeholders'])}"
+    markup = ReplyKeyboardMarkup(
+        [["Хочу голду"], ["Не хочу голду"], ["Вернуться в меню"]], one_time_keyboard=True
+    )
+    await send_and_record(update, context, state, greet_text, greet_img, markup)
+    return LABYRINTH_GAME
+
+
+async def labyrinth_handle_choice(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    state = load_laby_state(user_id)
+    choice = update.message.text.strip()
+    msgs = load_messages()
+
+    # Вернуться в меню
+    if choice == "Вернуться в меню":
+        for msg_id in state.messages:
+            try:
+                await context.bot.delete_message(
+                    chat_id=update.effective_chat.id, message_id=msg_id
+                )
+            except Exception:
+                pass
+        state.messages = []
+        save_laby_state(state)
+        await update.message.reply_text(
+            "🔓 <b>Вернулся в главное меню</b>", parse_mode="HTML", reply_markup=USER_KEYBOARD
+        )
+        return ConversationHandler.END
+
+    # 1. Не хочу голду → поражение №1
+    if choice == "Не хочу голду":
+        state.loses += 1
+        state.hp = LABYRINTH_START_HP
+        await send_defeat(update, context, state, reason="not_desire")
+        for msg_id in state.messages:
+            try:
+                await context.bot.delete_message(
+                    chat_id=update.effective_chat.id, message_id=msg_id
+                )
+            except Exception:
+                pass
+        state.messages = []
+        save_laby_state(state)
+        await update.message.reply_text(
+            "🔓 <b>Вернулся в главное меню</b>", parse_mode="HTML", reply_markup=USER_KEYBOARD
+        )
+        return ConversationHandler.END
+
+    # 2. Хочу голду → событие
+    if choice == "Хочу голду":
+        await handle_event(update, context, state, msgs)
+        save_laby_state(state)
+        return LABYRINTH_GAME
+
+    # 3. Пройти мимо → событие без специальные
+    if choice == "Пройти мимо":
+        await handle_event(update, context, state, msgs, skip_special=True)
+        save_laby_state(state)
+        return LABYRINTH_GAME
+
+    # 4. Смерть → поражение №2
+    if choice == "Смерть":
+        state.loses += 1
+        state.hp = LABYRINTH_START_HP
+        await send_defeat(update, context, state, reason="special_death")
+        for msg_id in state.messages:
+            try:
+                await context.bot.delete_message(
+                    chat_id=update.effective_chat.id, message_id=msg_id
+                )
+            except Exception:
+                pass
+        state.messages = []
+        save_laby_state(state)
+        await update.message.reply_text(
+            "🔓 <b>Вернулся в главное меню</b>", parse_mode="HTML", reply_markup=USER_KEYBOARD
+        )
+        return ConversationHandler.END
+
+    # 5. Движения
+    if choice in ("Налево", "Вперед", "Направо"):
+        state.step += 1
+        if state.step >= LABYRINTH_MAX_STEPS:
+            await send_victory(update, context, state, msgs)
+            state.wins += 1
+            state.hp = LABYRINTH_START_HP
+            for msg_id in state.messages:
+                try:
+                    await context.bot.delete_message(
+                        chat_id=update.effective_chat.id, message_id=msg_id
+                    )
+                except Exception:
+                    pass
+            state.messages = []
+            save_laby_state(state)
+            await update.message.reply_text(
+                "🔓 <b>Вернулся в главное меню</b>", parse_mode="HTML", reply_markup=USER_KEYBOARD
+            )
+            return ConversationHandler.END
+        await handle_event(update, context, state, msgs)
+        save_laby_state(state)
+        return LABYRINTH_GAME
+
+    return LABYRINTH_GAME
+
+
+async def handle_event(update: Update, context: ContextTypes.DEFAULT_TYPE,
+                      state: LabyrinthState, msgs: dict,
+                      skip_special: bool = False):
+    probs = {
+        1: 0.20,
+        2: 0.09,
+        3: 0.11,
+        4: 0.2475,
+        5: 0.1925,
+        6: 0.11,
+    }
+    if not skip_special:
+        probs[7] = 0.05
+    items, weights = zip(*probs.items())
+    sel = random.choices(items, weights=weights)[0]
+
+    if sel == 7:  # Special
+        tmpl = random.choice(msgs["events"]["special"])
+        text = resolve_placeholders(tmpl["text"], msgs["placeholders"])
+        msg_text = f"{text}\n💪 HP: {state.hp}"
+        markup = ReplyKeyboardMarkup(
+            [["Пройти мимо"], ["Смерть"], ["Вернуться в меню"]], one_time_keyboard=True
+        )
+        await send_and_record(update, context, state, msg_text, tmpl["image"], markup)
         return
 
-    if user_message.text == "Обычный режим":
-        await update.message.reply_text("🔓 <b>Переключено в обычный режим</b>", parse_mode='HTML', reply_markup=USER_KEYBOARD)
+    events = msgs["events"][str(sel)]
+    tmpl = random.choice(events)
+    delta = 0
+    effect = None
+    if sel == 2:
+        delta = 2
+        effect = "(+2 HP)"
+    elif sel == 3:
+        delta = 1
+        effect = "(+1 HP)"
+    elif sel == 4:
+        delta = -1
+        effect = "(-1 HP)"
+    elif sel == 5:
+        delta = -2
+        effect = "(-2 HP)"
+    elif sel == 6:
+        delta = -3
+        effect = "(-3 HP)"
+    state.hp += delta
+
+    if state.hp <= 0:
+        state.loses += 1
+        state.hp = LABYRINTH_START_HP
+        await send_defeat(update, context, state, reason="hp_zero")
         return
 
-    # ✅ Активируем режим предложки
-    if user_message.text == "Предложить новость":
-        context.user_data['awaiting_suggestion'] = True
-        await update.message.reply_text("📝 Отправь мне свой контент (текст, скрин или фрапс)!")
-        return
+    text = resolve_placeholders(tmpl["text"], msgs["placeholders"])
+    msg_text = f"{text}\n💪 HP: {state.hp}\n{effect if effect else ''}"
+    markup = ReplyKeyboardMarkup(
+        [["Налево"], ["Вперед"], ["Направо"], ["Вернуться в меню"]], one_time_keyboard=True
+    )
+    await send_and_record(update, context, state, msg_text, tmpl["image"], markup)
 
-    if user_message.text == "Помощь":
-        await update.message.reply_text("ℹ️ <b>Как пользоваться ботом:</b>\n• Нажмите 'Предложить новость'\n• Отправьте текст, фото или видео\n• Я перешлю его администраторам\n📌 Контент должен быть уникальным и интересным!", parse_mode='HTML')
-        return
 
-    # 🔥 Игра запускается через ConversationHandler — не вызываем вручную
-    if user_message.text == "Играть в Лабиринт":
-        return
+async def send_defeat(update: Update, context: ContextTypes.DEFAULT_TYPE,
+                     state: LabyrinthState, reason: str):
+    msgs = load_messages()
+    if reason == "not_desire":
+        tmpl = random.choice(msgs["defeat1"])
+    elif reason == "special_death":
+        tmpl = random.choice(msgs["defeat2"])
+    else:
+        tmpl = random.choice(msgs["defeat"])
+    text = resolve_placeholders(tmpl["text"], msgs["placeholders"])
+    msg_text = f"{text}\n⚠️ HP: {state.hp}"
+    await send_and_record(update, context, state, msg_text, tmpl["image"])
 
-    # ✅ Обработка админских команд
-    if await is_admin(user_id):
-        if user_message.text == "Статистика":
-            await show_statistics(update, context)
-            return
-        elif user_message.text == "Пользователи":
-            await show_users(update, context)
-            return
-        elif user_message.text == "Настройки":
-            await show_settings(update, context)
-            return
-        elif user_message.text == "Создать пост":
-            return await create_post(update, context)
 
-    # ✅ Обработка текстовой предложки — ТОЛЬКО если активирован режим
-    if context.user_data.get('awaiting_suggestion', False):
-        try:
-            user = update.effective_user
-            update_suggestion_stats(user.id)
-            report_text = f"""
-📥 НОВАЯ ПРЕДЛОЖКА
-├─ От: {user.first_name} (@{user.username or 'без username'})
-├─ ID: {user.id}
-└─ Тип: ТЕКСТ
-👇 СОДЕРЖИМОЕ:
-{user_message.text}
-"""
-            print(f"📤 Отправляем в группу {ADMIN_CHAT_ID}, тема {SUGGESTION_TOPIC_ID}")
-            await context.bot.send_message(chat_id=ADMIN_CHAT_ID, text=report_text, message_thread_id=SUGGESTION_TOPIC_ID)
-            await context.bot.send_message(chat_id=ADMIN_CHAT_ID, text="─" * 40, message_thread_id=SUGGESTION_TOPIC_ID)
-            await update.message.reply_text("✅ Получил! Твоя предложка отправлена модераторам. Спасибо! 💫", reply_markup=USER_KEYBOARD)
-            context.user_data['awaiting_suggestion'] = False  # Сбрасываем флаг
-        except Exception as e:
-            print(f"Ошибка в handle_message: {e}")
-            await update.message.reply_text("❌ Произошла ошибка. Попробуйте позже.")
-        return
+async def send_victory(update: Update, context: ContextTypes.DEFAULT_TYPE,
+                       state: LabyrinthState, msgs: dict):
+    tmpl = random.choice(msgs["victory"])
+    text = resolve_placeholders(tmpl["text"], msgs["placeholders"])
+    msg_text = f"{text}\n🏆 HP: {state.hp}"
+    await send_and_record(update, context, state, msg_text, tmpl["image"])
+    promo = get_daily_promo()
+    if promo:
+        await update.message.reply_text(
+            f"🎁 Твой промокод: <code>{promo}</code>", parse_mode="HTML"
+        )
+    else:
+        await update.message.reply_text(
+            "Извините, промокоды закончились, но вы все равно молодец!"
+        )
 
-    # ✅ Игнорируем все остальные сообщения БЕЗ ответа, пока не нажата кнопка "Предложить новость"
-    return
 
-# ===== ИНИЦИАЛИЗАЦИЯ И ЗАПУСК =====
+# --------------------------------------------------------------------------
+# 15. Отправка сообщения и автоматическое удаление
+# --------------------------------------------------------------------------
+async def send_message_with_cleanup(update: Update, context: ContextTypes.DEFAULT_TYPE,
+                                   text: str,
+                                   image: str | None = None,
+                                   reply_markup=None,
+                                   parse_mode="HTML"):
+    chat_id = update.effective_chat.id
+    if image and os.path.exists(os.path.join("images", image)):
+        with open(os.path.join("images", image), "rb") as f:
+            sent = await context.bot.send_photo(
+                chat_id=chat_id,
+                photo=f,
+                caption=text,
+                parse_mode=parse_mode,
+                reply_markup=reply_markup,
+            )
+    else:
+        sent = await context.bot.send_message(
+            chat_id=chat_id,
+            text=text,
+            parse_mode=parse_mode,
+            reply_markup=reply_markup,
+        )
+    asyncio.create_task(schedule_delete(context, chat_id, sent.message_id))
+    return sent.message_id
+
+
+async def schedule_delete(context: ContextTypes.DEFAULT_TYPE, chat_id: int, msg_id: int):
+    await asyncio.sleep(120)
+    try:
+        await context.bot.delete_message(chat_id=chat_id, message_id=msg_id)
+    except Exception:
+        pass
+
+
+# --------------------------------------------------------------------------
+# 16. Запуск бота
+# --------------------------------------------------------------------------
 def main():
-    # Создаем файлы, если их нет
-    for file, default in [
+    # Создаём пустые файлы при первом запуске
+    for path, default in [
         (STATS_FILE, load_stats()),
         (USERS_FILE, {}),
         (POSTS_FILE, {}),
-        (MIRROR_MAP_FILE, {})
+        (MIRROR_MAP_FILE, {}),
     ]:
-        if not os.path.exists(file):
-            safe_default = convert_sets_to_lists(default)
-            with open(file, 'w', encoding='utf-8') as f:
-                json.dump(safe_default, f, ensure_ascii=False, indent=2)
+        if not os.path.exists(path):
+            if isinstance(default, set):
+                default = list(default)
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(default, f, ensure_ascii=False, indent=2)
 
-    # Создаем папку images, если её нет
     if not os.path.exists("images"):
         os.makedirs("images")
         print("📁 Создана папка 'images'")
 
-    application = Application.builder().token(BOT_TOKEN).build()
+    app = Application.builder().token(BOT_TOKEN).build()
 
-    # Добавляем обработчики каналов
-    application.add_handler(MessageHandler(Chat(COMMENTS_CHAT_ID), handle_chat_message, block=False))
-    application.add_handler(MessageHandler(filters.ChatType.CHANNEL, handle_channel_post))
-
-    # Счётчик сообщений в чате комментариев (для статистики чата): учитываем любые сообщения, кроме сервисных
-    application.add_handler(
+    # Канал/комментарии
+    app.add_handler(
+        MessageHandler(filters.Chat(COMMENTS_CHAT_ID), handle_chat_message)
+    )
+    app.add_handler(
+        MessageHandler(filters.ChatType.CHANNEL, handle_channel_post)
+    )
+    app.add_handler(
         MessageHandler(
             filters.Chat(COMMENTS_CHAT_ID) & ~filters.StatusUpdate.ALL,
-            handle_group_message_stats,
-            block=False
+            handle_group_message_stats
         )
     )
 
-    # Игра "Лабиринт"
-    labyrinth_handler = ConversationHandler(
-        entry_points=[MessageHandler(filters.Regex("^Играть в Лабиринт$"), start_labyrinth_game)],
-        states={
-            LABYRINTH_GAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_labyrinth_choice)]
-        },
+    # Лабиринт
+    labyrinth_conv = ConversationHandler(
+        entry_points=[MessageHandler(filters.Regex("^Играть в Лабиринт$"), start_labyrinth)],
+        states={LABYRINTH_GAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, labyrinth_handle_choice)]},
         fallbacks=[],
-        allow_reentry=True
+        allow_reentry=True,
     )
-    application.add_handler(labyrinth_handler)
+    app.add_handler(labyrinth_conv)
 
-    # Создание поста — ✅ ВОССТАНОВЛЕНО
-    conv_handler = ConversationHandler(
+    # Создание постов
+    post_conv = ConversationHandler(
         entry_points=[MessageHandler(filters.Regex("^Создать пост$"), create_post)],
         states={
             GET_TEXT: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_post_text)],
-            GET_BUTTONS: [MessageHandler(filters.TEXT & ~filters.COMMAND, process_buttons)]
+            GET_BUTTONS: [MessageHandler(filters.TEXT & ~filters.COMMAND, process_buttons)],
         },
         fallbacks=[MessageHandler(filters.Regex("^Отменить создание$"), cancel_creation)],
-        allow_reentry=True
+        allow_reentry=True,
     )
-    application.add_handler(conv_handler)
+    app.add_handler(post_conv)
 
-    # Основные обработчики
-    application.add_handler(CommandHandler("start", start))
-    application.add_handler(CommandHandler("debug", debug_info))
-    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-    application.add_handler(MessageHandler(filters.PHOTO | filters.VIDEO | filters.Document.ALL, handle_media))
+    # Основные команды и сообщения
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("debug", debug_info))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+    app.add_handler(
+        MessageHandler(
+            filters.PHOTO | filters.VIDEO | filters.Document.ALL,
+            handle_media
+        )
+    )
 
     print("🤖 Бот запущен!")
-    print("💬 Теперь бот будет оставлять комментарии ПОД ПОСТАМИ в канале")
-    print(f"📍 ID канала: {CHANNEL_CHAT_ID}")
-    print(f"📍 ID чата комментариев: {COMMENTS_CHAT_ID}")
-    print(f"📍 ID группы предложек: {GROUP_CHAT_ID}")
-    print(f"📌 Предложки пересылаются в тему ID: {SUGGESTION_TOPIC_ID}")
-    print("✅ Просто опубликуй пост в канале — бот сам найдёт его в чате комментариев и сделает реплай")
-    print("🎮 Игра 'Лабиринт Смерти' полностью исправлена и готова к тестированию!")
+    app.run_polling()
 
-    application.run_polling()
 
 if __name__ == "__main__":
     main()
